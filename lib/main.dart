@@ -2,16 +2,16 @@ import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
 
 void main() {
-  runApp(const OneSec());
+  runApp(const LessScroll());
 }
 
-class OneSec extends StatelessWidget {
-  const OneSec({super.key});
+class LessScroll extends StatelessWidget {
+  const LessScroll({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'one sec',
+      title: 'LessScroll',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(

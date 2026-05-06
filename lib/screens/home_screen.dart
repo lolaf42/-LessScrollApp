@@ -49,7 +49,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
-      _serviceRunning = running || (usage && overlay && apps.isNotEmpty);
+      _serviceRunning = running;
       _hasUsagePerm = usage;
       _hasOverlayPerm = overlay;
       _blockedApps = apps;
@@ -81,7 +81,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         title: const Text(
-          'one sec',
+          'LessScroll',
           style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
         ),
         actions: [
@@ -157,7 +157,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           const SizedBox(height: 8),
           Text(
             _serviceRunning
-                ? 'one sec überwacht ${_blockedApps.length} App${_blockedApps.length == 1 ? '' : 's'}'
+                ? 'LessScroll überwacht ${_blockedApps.length} App${_blockedApps.length == 1 ? '' : 's'}'
                 : allPermsOk
                     ? 'Schalte ein, um Apps zu pausieren'
                     : 'Berechtigungen fehlen',

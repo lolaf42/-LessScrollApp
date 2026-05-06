@@ -102,7 +102,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: const Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('one sec', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                Text('LessScroll', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                 SizedBox(height: 8),
                 Text(
                   'Erzeugt eine kleine Pause, bevor du ablenkende Apps öffnest – damit du bewusster entscheidest.',

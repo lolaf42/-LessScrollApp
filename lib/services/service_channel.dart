@@ -1,7 +1,7 @@
 import 'package:flutter/services.dart';
 
 class ServiceChannel {
-  static const _channel = MethodChannel('onesec/service');
+  static const _channel = MethodChannel('lessscroll/service');
 
   static Future<void> startService() => _channel.invokeMethod('startService');
   static Future<void> stopService() => _channel.invokeMethod('stopService');

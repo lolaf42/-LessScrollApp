@@ -13,7 +13,7 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
 
     companion object {
-        const val CHANNEL = "onesec/service"
+        const val CHANNEL = "lessscroll/service"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {

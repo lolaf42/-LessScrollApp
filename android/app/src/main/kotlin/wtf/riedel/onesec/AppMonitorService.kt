@@ -34,6 +34,7 @@ class AppMonitorService : Service() {
     private var overlayView: View? = null
     private var timer: Timer? = null
     private var lastEventTime = 0L
+    private var lastForegroundPkg = ""
     @Volatile private var overlayShowing = false
 
     override fun onCreate() {
@@ -58,30 +59,58 @@ class AppMonitorService : Service() {
 
     private fun startMonitoring() {
         lastEventTime = System.currentTimeMillis()
+        lastForegroundPkg = detectCurrentApp() ?: ""
         timer = Timer()
         timer?.scheduleAtFixedRate(object : TimerTask() {
-            override fun run() { processUsageEvents() }
+            override fun run() { checkForeground() }
         }, 500, 500)
     }
 
-    private fun processUsageEvents() {
-        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+    private fun checkForeground() {
         val now = System.currentTimeMillis()
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+
+        // Primary: event stream – fast and precise on stock Android
         val events = usm.queryEvents(lastEventTime, now)
         lastEventTime = now
         val event = UsageEvents.Event()
+        var detectedPkg: String? = null
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
-            if (event.eventType != UsageEvents.Event.MOVE_TO_FOREGROUND) continue
-            val pkg = event.packageName
-            if (pkg == packageName) continue
-            val blocked = loadBlockedPackages()
-            if (blocked.contains(pkg) && !overlayShowing) {
-                Handler(Looper.getMainLooper()).post { showOverlay(pkg) }
-            } else if (!blocked.contains(pkg) && overlayShowing) {
-                Handler(Looper.getMainLooper()).post { dismissOverlay() }
+            if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND &&
+                event.packageName != packageName) {
+                detectedPkg = event.packageName
             }
         }
+
+        // Fallback: usage stats – covers custom ROMs and delayed event reporting
+        if (detectedPkg == null) {
+            detectedPkg = usm
+                .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 2000, now)
+                ?.maxByOrNull { it.lastTimeUsed }
+                ?.takeIf { it.packageName != packageName && (now - it.lastTimeUsed) < 1500 }
+                ?.packageName
+        }
+
+        val pkg = detectedPkg ?: return
+        if (pkg == lastForegroundPkg) return
+        lastForegroundPkg = pkg
+
+        val blocked = loadBlockedPackages()
+        if (blocked.contains(pkg) && !overlayShowing) {
+            Handler(Looper.getMainLooper()).post { showOverlay(pkg) }
+        } else if (!blocked.contains(pkg) && overlayShowing) {
+            Handler(Looper.getMainLooper()).post { dismissOverlay() }
+        }
+    }
+
+    private fun detectCurrentApp(): String? {
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val now = System.currentTimeMillis()
+        return usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 10000, now)
+            ?.maxByOrNull { it.lastTimeUsed }
+            ?.takeIf { it.packageName != packageName }
+            ?.packageName
     }
 
     private fun getOpenCount(packageName: String): Int {

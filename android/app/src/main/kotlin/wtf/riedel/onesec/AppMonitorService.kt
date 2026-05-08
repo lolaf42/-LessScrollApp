@@ -33,8 +33,8 @@ class AppMonitorService : Service() {
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
     private var timer: Timer? = null
-    private var lastForegroundApp = ""
-    private var overlayShowing = false
+    private var lastEventTime = 0L
+    @Volatile private var overlayShowing = false
 
     override fun onCreate() {
         super.onCreate()
@@ -57,29 +57,31 @@ class AppMonitorService : Service() {
     // ── Monitoring ────────────────────────────────────────────────────────────
 
     private fun startMonitoring() {
+        lastEventTime = System.currentTimeMillis()
         timer = Timer()
         timer?.scheduleAtFixedRate(object : TimerTask() {
-            override fun run() {
-                val current = getForegroundApp() ?: return
-                val blocked = loadBlockedPackages()
-                if (current != lastForegroundApp) {
-                    lastForegroundApp = current
-                    if (blocked.contains(current) && !overlayShowing) {
-                        Handler(Looper.getMainLooper()).post { showOverlay(current) }
-                    }
-                }
-                if (overlayShowing && !blocked.contains(current)) {
-                    Handler(Looper.getMainLooper()).post { dismissOverlay() }
-                }
-            }
-        }, 0, 1000)
+            override fun run() { processUsageEvents() }
+        }, 500, 500)
     }
 
-    private fun getForegroundApp(): String? {
+    private fun processUsageEvents() {
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
-        val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 5000, now)
-        return stats?.maxByOrNull { it.lastTimeUsed }?.packageName
+        val events = usm.queryEvents(lastEventTime, now)
+        lastEventTime = now
+        val event = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            if (event.eventType != UsageEvents.Event.MOVE_TO_FOREGROUND) continue
+            val pkg = event.packageName
+            if (pkg == packageName) continue
+            val blocked = loadBlockedPackages()
+            if (blocked.contains(pkg) && !overlayShowing) {
+                Handler(Looper.getMainLooper()).post { showOverlay(pkg) }
+            } else if (!blocked.contains(pkg) && overlayShowing) {
+                Handler(Looper.getMainLooper()).post { dismissOverlay() }
+            }
+        }
     }
 
     private fun getOpenCount(packageName: String): Int {

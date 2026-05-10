@@ -6,14 +6,18 @@ import android.animation.ValueAnimator
 import android.app.*
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.drawable.Drawable
 import android.os.*
 import android.view.*
-import android.view.animation.DecelerateInterpolator
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.PathInterpolator
 import android.widget.*
 import androidx.core.app.NotificationCompat
 import java.util.Timer
@@ -37,18 +41,40 @@ class AppMonitorService : Service() {
     private var lastForegroundPkg = ""
     @Volatile private var overlayShowing = false
 
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> pauseMonitoring()
+                Intent.ACTION_SCREEN_ON  -> resumeMonitoring()
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        registerReceiver(screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        })
         startMonitoring()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         timer?.cancel()
         dismissOverlay()
     }
@@ -56,6 +82,20 @@ class AppMonitorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     // ── Monitoring ────────────────────────────────────────────────────────────
+
+    private fun pauseMonitoring() {
+        timer?.cancel()
+        timer = null
+        dismissOverlay()
+    }
+
+    private fun resumeMonitoring() {
+        if (timer == null) {
+            lastForegroundPkg = ""
+            lastEventTime = System.currentTimeMillis()
+            startMonitoring()
+        }
+    }
 
     private fun startMonitoring() {
         lastEventTime = System.currentTimeMillis()
@@ -83,12 +123,14 @@ class AppMonitorService : Service() {
             }
         }
 
-        // Fallback: usage stats – covers custom ROMs and delayed event reporting
+        // Fallback: usage stats – covers custom ROMs and delayed event reporting.
+        // Only use if lastTimeUsed is very recent (<800ms) to avoid picking up
+        // background services (e.g. WhatsApp) that update lastTimeUsed passively.
         if (detectedPkg == null) {
             detectedPkg = usm
                 .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 2000, now)
                 ?.maxByOrNull { it.lastTimeUsed }
-                ?.takeIf { it.packageName != packageName && (now - it.lastTimeUsed) < 1500 }
+                ?.takeIf { it.packageName != packageName && (now - it.lastTimeUsed) < 800 }
                 ?.packageName
         }
 
@@ -132,7 +174,9 @@ class AppMonitorService : Service() {
     private fun loadBlockedPackages(): Set<String> {
         val prefs: SharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(BLOCKED_KEY, null) ?: return emptySet()
-        return raw.trim().removePrefix("[").removeSuffix("]")
+        // Flutter stores List<String> with a base64 type-prefix followed by '!'
+        val json = if (raw.contains('!')) raw.substringAfter('!') else raw
+        return json.trim().removePrefix("[").removeSuffix("]")
             .split(",")
             .map { it.trim().removeSurrounding("\"") }
             .filter { it.isNotEmpty() }
@@ -141,7 +185,8 @@ class AppMonitorService : Service() {
 
     private fun loadCountdownSeconds(): Int {
         val prefs: SharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getInt(COUNTDOWN_KEY, 5)
+        // Flutter stores int/double values as Long in SharedPreferences
+        return try { prefs.getLong(COUNTDOWN_KEY, 5L).toInt() } catch (_: Exception) { prefs.getInt(COUNTDOWN_KEY, 5) }
     }
 
     // ── Overlay ───────────────────────────────────────────────────────────────
@@ -171,6 +216,8 @@ class AppMonitorService : Service() {
             try { windowManager?.removeView(it) } catch (_: Exception) {}
         }
         overlayView = null
+        // Reset so the same app triggers the overlay again on next open
+        lastForegroundPkg = ""
     }
 
     // ── Overlay View ──────────────────────────────────────────────────────────
@@ -200,32 +247,44 @@ class AppMonitorService : Service() {
             FrameLayout.LayoutParams.MATCH_PARENT
         ).apply { gravity = Gravity.BOTTOM })
 
-        // Start the breathing animation sequence
-        startBreathingSequence(waveView, infoCard)
+        // Start animation only after the view is attached to the window.
+        // ValueAnimator needs Choreographer vsync signals which only flow once
+        // the overlay window is active — starting before addView causes the
+        // animation to stall until the first touch event.
+        root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                v.removeOnAttachStateChangeListener(this)
+                startBreathingSequence(waveView, infoCard)
+            }
+            override fun onViewDetachedFromWindow(v: View) {}
+        })
 
         return root
     }
 
     private fun startBreathingSequence(waveView: WaveView, infoCard: View) {
-        // Phase 1: Inhale – wave rises from 0 to 1 (1.8s)
+        // Natural human breathing follows a sine curve: slow start, faster in middle, slow end.
+        // Exhale is always longer than inhale. Hold at top mimics the natural pause after a full breath.
+        val sineIn = PathInterpolator(0.37f, 0f, 0.63f, 1f)   // cubic bezier ≈ sin
+        val sineOut = PathInterpolator(0.37f, 0f, 0.63f, 1f)
+
+        // Phase 1: Inhale – 3.5s, slow-fast-slow rise
         val inhale = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 1800
-            interpolator = DecelerateInterpolator(1.5f)
+            duration = 3500
+            interpolator = sineIn
             addUpdateListener { waveView.fillRatio = it.animatedValue as Float }
         }
 
-        // Phase 2: Hold at top (400ms pause, no animation)
+        // Phase 2: Hold at top 1.2s – the natural pause after a full inhale
 
-        // Phase 3: Exhale – panel drops from 1 to 0 (1.4s), then info card appears
+        // Phase 3: Exhale – 4.5s (longer than inhale), slow-fast-slow descent
         val exhale = ValueAnimator.ofFloat(1f, 0f).apply {
-            duration = 1600
-            interpolator = DecelerateInterpolator(1.2f)
+            duration = 4500
+            interpolator = sineOut
             addUpdateListener { waveView.fillRatio = it.animatedValue as Float }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
-                    // Fade in info card as wave settles
-                    infoCard.animate().alpha(1f).setDuration(400).start()
-                    // Enable touch on overlay
+                    infoCard.animate().alpha(1f).setDuration(600).start()
                     overlayView?.let {
                         (it.layoutParams as? WindowManager.LayoutParams)?.flags =
                             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
@@ -235,10 +294,10 @@ class AppMonitorService : Service() {
             })
         }
 
-        // Chain: inhale → 400ms pause → exhale
+        // Chain: inhale → 1.2s natural hold → exhale
         inhale.addListener(object : AnimatorListenerAdapter() {
             override fun onAnimationEnd(animation: Animator) {
-                Handler(Looper.getMainLooper()).postDelayed({ exhale.start() }, 400)
+                Handler(Looper.getMainLooper()).postDelayed({ exhale.start() }, 1200)
             }
         })
 
@@ -346,7 +405,7 @@ class AppMonitorService : Service() {
         card.addView(openBtn)
         card.addView(backBtn)
 
-        // Countdown timer (starts after wave animation ~3.6s total)
+        // Countdown timer starts after breathing animation completes (~9.2s total)
         Handler(Looper.getMainLooper()).postDelayed({
             object : CountDownTimer((countdownSecs * 1000).toLong(), 1000) {
                 override fun onTick(ms: Long) { countdownView.text = ((ms / 1000) + 1).toString() }
@@ -355,7 +414,7 @@ class AppMonitorService : Service() {
                     openBtn.visibility = View.VISIBLE
                 }
             }.start()
-        }, 3800)
+        }, 9200)
 
         return card
     }

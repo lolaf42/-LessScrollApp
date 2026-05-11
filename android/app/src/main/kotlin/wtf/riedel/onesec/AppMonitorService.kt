@@ -216,8 +216,6 @@ class AppMonitorService : Service() {
             try { windowManager?.removeView(it) } catch (_: Exception) {}
         }
         overlayView = null
-        // Reset so the same app triggers the overlay again on next open
-        lastForegroundPkg = ""
     }
 
     // ── Overlay View ──────────────────────────────────────────────────────────

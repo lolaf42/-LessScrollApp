@@ -40,6 +40,8 @@ class AppMonitorService : Service() {
     private var lastEventTime = 0L
     private var lastForegroundPkg = ""
     @Volatile private var overlayShowing = false
+    private val lastLeftPkgTime = mutableMapOf<String, Long>()
+    private val GRACE_PERIOD_MS = 15_000L
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -136,10 +138,19 @@ class AppMonitorService : Service() {
 
         val pkg = detectedPkg ?: return
         if (pkg == lastForegroundPkg) return
-        lastForegroundPkg = pkg
 
         val blocked = loadBlockedPackages()
+
+        // When leaving a blocked app, record the time for the grace-period check
+        if (blocked.contains(lastForegroundPkg)) {
+            lastLeftPkgTime[lastForegroundPkg] = now
+        }
+
+        lastForegroundPkg = pkg
+
         if (blocked.contains(pkg) && !overlayShowing) {
+            val lastLeft = lastLeftPkgTime[pkg] ?: 0L
+            if (now - lastLeft < GRACE_PERIOD_MS) return  // returned within 15s (e.g. via multitasking)
             Handler(Looper.getMainLooper()).post { showOverlay(pkg) }
         } else if (!blocked.contains(pkg) && overlayShowing) {
             Handler(Looper.getMainLooper()).post { dismissOverlay() }
@@ -230,7 +241,22 @@ class AppMonitorService : Service() {
         // Almost opaque black – app barely visible behind
         root.setBackgroundColor(Color.argb(242, 8, 8, 12))
 
-        // Wave view behind everything
+        // Intro text – visible first, then covered by the rising wave
+        val introText = TextView(this).apply {
+            text = "Es ist Zeit für einen\ntiefen Atemzug...."
+            textSize = 28f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            )
+        }
+        root.addView(introText)
+
+        // Wave view – rises from bottom, covering the intro text
         val waveView = WaveView(this)
         root.addView(waveView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -252,7 +278,7 @@ class AppMonitorService : Service() {
         root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) {
                 v.removeOnAttachStateChangeListener(this)
-                startBreathingSequence(waveView, infoCard)
+                startBreathingSequence(waveView, introText, infoCard)
             }
             override fun onViewDetachedFromWindow(v: View) {}
         })
@@ -260,25 +286,13 @@ class AppMonitorService : Service() {
         return root
     }
 
-    private fun startBreathingSequence(waveView: WaveView, infoCard: View) {
-        // Natural human breathing follows a sine curve: slow start, faster in middle, slow end.
-        // Exhale is always longer than inhale. Hold at top mimics the natural pause after a full breath.
-        val sineIn = PathInterpolator(0.37f, 0f, 0.63f, 1f)   // cubic bezier ≈ sin
-        val sineOut = PathInterpolator(0.37f, 0f, 0.63f, 1f)
+    private fun startBreathingSequence(waveView: WaveView, introText: View, infoCard: View) {
+        val sineInterp = PathInterpolator(0.37f, 0f, 0.63f, 1f)
 
-        // Phase 1: Inhale – 3.5s, slow-fast-slow rise
-        val inhale = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 3500
-            interpolator = sineIn
-            addUpdateListener { waveView.fillRatio = it.animatedValue as Float }
-        }
-
-        // Phase 2: Hold at top 1.2s – the natural pause after a full inhale
-
-        // Phase 3: Exhale – 4.5s (longer than inhale), slow-fast-slow descent
+        // Phase 3: Exhale – 4.5s descent; info card fades in when done
         val exhale = ValueAnimator.ofFloat(1f, 0f).apply {
             duration = 4500
-            interpolator = sineOut
+            interpolator = sineInterp
             addUpdateListener { waveView.fillRatio = it.animatedValue as Float }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
@@ -292,12 +306,19 @@ class AppMonitorService : Service() {
             })
         }
 
-        // Chain: inhale → 1.2s natural hold → exhale
-        inhale.addListener(object : AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: Animator) {
-                Handler(Looper.getMainLooper()).postDelayed({ exhale.start() }, 1200)
-            }
-        })
+        // Phase 1: Inhale – 3.5s rise covering the intro text
+        // Phase 2: Hold at top 1.2s, fade out intro text, then start exhale
+        val inhale = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 3500
+            interpolator = sineInterp
+            addUpdateListener { waveView.fillRatio = it.animatedValue as Float }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    introText.animate().alpha(0f).setDuration(400).start()
+                    Handler(Looper.getMainLooper()).postDelayed({ exhale.start() }, 1200)
+                }
+            })
+        }
 
         inhale.start()
     }

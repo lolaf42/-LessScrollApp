@@ -14,6 +14,7 @@ import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.os.*
 import android.view.*
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -31,11 +32,11 @@ class AppMonitorService : Service() {
         const val NOTIFICATION_ID = 1
         const val PREFS_NAME = "FlutterSharedPreferences"
         const val BLOCKED_KEY = "flutter.blocked_apps"
-        const val COUNTDOWN_KEY = "flutter.countdown_seconds"
     }
 
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
+    private var currentOverlayPkg = ""
     private var timer: Timer? = null
     private var lastEventTime = 0L
     private var lastForegroundPkg = ""
@@ -194,12 +195,6 @@ class AppMonitorService : Service() {
             .toSet()
     }
 
-    private fun loadCountdownSeconds(): Int {
-        val prefs: SharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        // Flutter stores int/double values as Long in SharedPreferences
-        return try { prefs.getLong(COUNTDOWN_KEY, 5L).toInt() } catch (_: Exception) { prefs.getInt(COUNTDOWN_KEY, 5) }
-    }
-
     // ── Overlay ───────────────────────────────────────────────────────────────
 
     private fun showOverlay(packageName: String) {
@@ -218,11 +213,16 @@ class AppMonitorService : Service() {
 
         val view = buildOverlayView(packageName)
         overlayView = view
+        currentOverlayPkg = packageName
         windowManager?.addView(view, params)
     }
 
     private fun dismissOverlay() {
         overlayShowing = false
+        if (currentOverlayPkg.isNotEmpty()) {
+            lastLeftPkgTime[currentOverlayPkg] = System.currentTimeMillis()
+            currentOverlayPkg = ""
+        }
         overlayView?.let {
             try { windowManager?.removeView(it) } catch (_: Exception) {}
         }
@@ -234,14 +234,10 @@ class AppMonitorService : Service() {
     private fun buildOverlayView(packageName: String): View {
         val appName = getAppName(packageName)
         val openCount = getOpenCount(packageName)
-        val countdownSecs = loadCountdownSeconds()
 
         val root = FrameLayout(this)
-
-        // Almost opaque black – app barely visible behind
         root.setBackgroundColor(Color.argb(242, 8, 8, 12))
 
-        // Intro text – visible first, then covered by the rising wave
         val introText = TextView(this).apply {
             text = "Es ist Zeit für einen\ntiefen Atemzug...."
             textSize = 28f
@@ -256,25 +252,19 @@ class AppMonitorService : Service() {
         }
         root.addView(introText)
 
-        // Wave view – rises from bottom, covering the intro text
         val waveView = WaveView(this)
         root.addView(waveView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         ))
 
-        // Info card – starts invisible, fades in after wave descends
-        val infoCard = buildInfoCard(appName, openCount, countdownSecs, packageName)
+        val infoCard = buildInfoCard(appName, openCount, packageName)
         infoCard.alpha = 0f
         root.addView(infoCard, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
-        ).apply { gravity = Gravity.BOTTOM })
+        ))
 
-        // Start animation only after the view is attached to the window.
-        // ValueAnimator needs Choreographer vsync signals which only flow once
-        // the overlay window is active — starting before addView causes the
-        // animation to stall until the first touch event.
         root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) {
                 v.removeOnAttachStateChangeListener(this)
@@ -323,90 +313,72 @@ class AppMonitorService : Service() {
         inhale.start()
     }
 
-    private fun buildInfoCard(
-        appName: String,
-        openCount: Int,
-        countdownSecs: Int,
-        packageName: String
-    ): View {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
+    private fun buildInfoCard(appName: String, openCount: Int, packageName: String): View {
+        val root = FrameLayout(this).apply {
             setPadding(dpToPx(32), dpToPx(48), dpToPx(32), dpToPx(64))
         }
 
-        // App icon
-        val iconView = ImageView(this).apply {
-            try { setImageDrawable(packageManager.getApplicationIcon(packageName)) }
-            catch (_: Exception) {}
-            val s = dpToPx(64)
-            layoutParams = LinearLayout.LayoutParams(s, s).apply { bottomMargin = dpToPx(16) }
+        // Center: large count number + description text
+        val centerGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
+            )
         }
 
-        // App name
-        val nameView = TextView(this).apply {
-            text = appName
-            textSize = 22f
+        centerGroup.addView(TextView(this).apply {
+            text = openCount.toString()
+            textSize = 88f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dpToPx(12) }
-        }
+            )
+        })
 
-        // Usage stat
-        val usageText = when {
-            openCount == 0 -> "Heute noch nicht geöffnet"
-            openCount == 1 -> "Heute bereits 1× geöffnet"
-            else -> "Heute bereits ${openCount}× geöffnet"
-        }
-        val usageView = TextView(this).apply {
-            text = usageText
-            textSize = 15f
-            setTextColor(Color.argb(200, 255, 255, 255))
+        centerGroup.addView(TextView(this).apply {
+            text = "attempts to open $appName within the\nlast 24 hours."
+            textSize = 16f
+            setTextColor(Color.argb(210, 255, 255, 255))
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dpToPx(8) }
+            ).apply { topMargin = dpToPx(12) }
+        })
+
+        root.addView(centerGroup)
+
+        // Bottom: pill button + text link
+        val bottomGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM
+            )
         }
 
-        // Question
-        val questionView = TextView(this).apply {
-            text = "Möchtest du die App wirklich öffnen?"
-            textSize = 13f
-            setTextColor(Color.argb(150, 255, 255, 255))
+        bottomGroup.addView(TextView(this).apply {
+            text = "I don't want to open $appName"
+            textSize = 16f
+            setTextColor(Color.argb(255, 35, 25, 65))
             gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.argb(255, 185, 170, 228))
+                cornerRadius = dpToPx(32).toFloat()
+            }
+            setPadding(dpToPx(24), dpToPx(18), dpToPx(24), dpToPx(18))
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dpToPx(36) }
-        }
-
-        // Countdown text
-        val countdownView = TextView(this).apply {
-            text = countdownSecs.toString()
-            textSize = 48f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dpToPx(32) }
-        }
-
-        // Open button (hidden until countdown ends)
-        val openBtn = buildButton("Trotzdem öffnen", Color.argb(60, 255, 255, 255)).apply {
-            visibility = View.INVISIBLE
-            setOnClickListener { dismissOverlay() }
-        }
-
-        // Back button
-        val backBtn = buildButton("Zurück zum Startbildschirm", Color.TRANSPARENT).apply {
-            setTextColor(Color.argb(180, 255, 255, 255))
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(60)
+            )
             setOnClickListener {
                 dismissOverlay()
                 startActivity(Intent(Intent.ACTION_MAIN).apply {
@@ -414,40 +386,23 @@ class AppMonitorService : Service() {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK
                 })
             }
-        }
+        })
 
-        card.addView(iconView)
-        card.addView(nameView)
-        card.addView(usageView)
-        card.addView(questionView)
-        card.addView(countdownView)
-        card.addView(openBtn)
-        card.addView(backBtn)
-
-        // Countdown timer starts after breathing animation completes (~9.2s total)
-        Handler(Looper.getMainLooper()).postDelayed({
-            object : CountDownTimer((countdownSecs * 1000).toLong(), 1000) {
-                override fun onTick(ms: Long) { countdownView.text = ((ms / 1000) + 1).toString() }
-                override fun onFinish() {
-                    countdownView.text = "✓"
-                    openBtn.visibility = View.VISIBLE
-                }
-            }.start()
-        }, 9200)
-
-        return card
-    }
-
-    private fun buildButton(label: String, bgColor: Int): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 14f
+        bottomGroup.addView(TextView(this).apply {
+            text = "Continue on $appName"
+            textSize = 16f
             setTextColor(Color.WHITE)
-            setBackgroundColor(bgColor)
+            gravity = Gravity.CENTER
+            setPadding(dpToPx(16), dpToPx(16), dpToPx(16), dpToPx(16))
             layoutParams = LinearLayout.LayoutParams(
-                dpToPx(260), dpToPx(48)
-            ).apply { bottomMargin = dpToPx(12) }
-        }
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dpToPx(4) }
+            setOnClickListener { dismissOverlay() }
+        })
+
+        root.addView(bottomGroup)
+        return root
     }
 
     private fun getAppName(packageName: String): String {
